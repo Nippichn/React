@@ -1,0 +1,972 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import {
+    getAuth,
+    signInAnonymously,
+    signInWithCustomToken,
+    onAuthStateChanged,
+    signOut,
+    createUserWithEmailAndPassword, // For registration
+    signInWithEmailAndPassword // For email/password login
+} from 'firebase/auth';
+import {
+    getFirestore,
+    doc,
+    setDoc, // For setting user roles/profiles
+    updateDoc,
+    onSnapshot,
+    collection,
+    query,
+    addDoc,
+    serverTimestamp,
+    getDocs, // For fetching multiple docs (e.g., all users for admin)
+    deleteDoc,
+    getDoc // For getting a single doc (e.g., user profile)
+} from 'firebase/firestore';
+
+// Main App component
+const App = () => {
+    // State variables for Firebase and user data
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [userEmail, setUserEmail] = useState(''); // To store current user's email
+    const [userRole, setUserRole] = useState('guest'); // 'guest', 'student', 'admin'
+    const [isAuthReady, setIsAuthReady] = useState(false); // To ensure Firebase is initialized and auth state is checked
+
+    // Authentication form states
+    const [loginEmail, setLoginEmail] = useState('');
+    const [loginPassword, setLoginPassword] = useState('');
+    const [registerEmail, setRegisterEmail] = useState('');
+    const [registerPassword, setRegisterPassword] = useState('');
+    const [registerConfirmPassword, setRegisterConfirmPassword] = useState('');
+
+    // Savings data states
+    const [savingsAmount, setSavingsAmount] = useState('');
+    const [savingsDescription, setSavingsDescription] = useState('');
+    const [savingsHistory, setSavingsHistory] = useState([]);
+    const [totalSavings, setTotalSavings] = useState(0);
+
+    // UI and Modal states
+    const [currentView, setCurrentView] = useState('dashboard'); // 'dashboard', 'save', 'history', 'import-export', 'login-register', 'admin-dashboard'
+    const [message, setMessage] = useState(''); // For user messages (e.g., success/error)
+    const [isModalOpen, setIsModalOpen] = useState(false); // For custom alert/confirmation modal
+    const [modalContent, setModalContent] = useState({ title: '', message: '', type: 'info' });
+    const [modalAction, setModalAction] = useState(null); // Function to execute on modal confirm
+
+    // Admin specific states
+    const [allStudents, setAllStudents] = useState([]);
+    const [selectedStudentId, setSelectedStudentId] = useState(null);
+    const [selectedStudentEmail, setSelectedStudentEmail] = useState('');
+    const [selectedStudentSavings, setSelectedStudentSavings] = useState([]);
+    const [selectedStudentTotalSavings, setSelectedStudentTotalSavings] = useState(0);
+
+    // --- Firebase Initialization and Authentication ---
+    useEffect(() => {
+        try {
+            // Get Firebase config and app ID from global variables
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+            // Initialize Firebase App
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            // Listen for authentication state changes
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                    setUserEmail(user.email || 'Anonymous');
+
+                    // Fetch user role from Firestore (public_data/user_metadata)
+                    const userProfileRef = doc(firestoreDb, `artifacts/${appId}/public/data/user_metadata`, user.uid);
+                    const userProfileSnap = await getDoc(userProfileRef);
+
+                    if (userProfileSnap.exists()) {
+                        setUserRole(userProfileSnap.data().role);
+                    } else {
+                        // If no profile exists (e.g., after anonymous sign-in), set default role and create profile
+                        await setDoc(userProfileRef, {
+                            email: user.email || 'anonymous@example.com',
+                            role: 'student', // Default role
+                            createdAt: serverTimestamp()
+                        });
+                        setUserRole('student');
+                    }
+                    setMessage(`เข้าสู่ระบบในฐานะ: ${user.email || 'ผู้ใช้งานนิรนาม'} (${userProfileSnap.exists() ? userProfileSnap.data().role : 'student'})`);
+                    setCurrentView('dashboard'); // Redirect to dashboard after login
+                } else {
+                    // Sign in anonymously if no initial token is provided
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(firebaseAuth);
+                    }
+                    setUserId(firebaseAuth.currentUser?.uid || crypto.randomUUID()); // Fallback for anonymous or initial sign-in
+                    setUserEmail('');
+                    setUserRole('guest');
+                    setMessage('กำลังเข้าสู่ระบบ...');
+                    setCurrentView('login-register'); // Show login/register page if not logged in
+                }
+                setIsAuthReady(true); // Firebase auth check is complete
+            });
+
+            // Cleanup subscription on unmount
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Error initializing Firebase:", error);
+            setMessage(`ข้อผิดพลาดในการเริ่มต้น Firebase: ${error.message}`);
+        }
+    }, []);
+
+    // --- Fetch and Listen to Savings Data (for Students) ---
+    useEffect(() => {
+        if (!db || !userId || !isAuthReady || userRole === 'admin') return; // Wait for Firebase to be ready and user ID to be set, and not for admin view
+
+        const savingsCollectionRef = collection(db, `artifacts/${userId}/users/${userId}/savings`);
+        const q = query(savingsCollectionRef);
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            let currentTotal = 0;
+            const history = [];
+            snapshot.forEach((doc) => {
+                const data = doc.data();
+                if (data.amount) {
+                    currentTotal += data.amount;
+                }
+                history.push({ id: doc.id, ...data });
+            });
+
+            // Sort history by timestamp in descending order (newest first)
+            history.sort((a, b) => (b.timestamp?.toDate() || 0) - (a.timestamp?.toDate() || 0));
+
+            setTotalSavings(currentTotal);
+            setSavingsHistory(history);
+        }, (error) => {
+            console.error("Error fetching savings data for student:", error);
+            setMessage(`ข้อผิดพลาดในการดึงข้อมูล: ${error.message}`);
+            showModal('ผิดพลาด', `ไม่สามารถดึงข้อมูลการออมได้: ${error.message}`, 'error');
+        });
+
+        // Cleanup subscription on unmount
+        return () => unsubscribe();
+    }, [db, userId, isAuthReady, userRole]); // Re-run when db, userId, auth status, or userRole changes
+
+    // --- Admin: Fetch all registered students ---
+    useEffect(() => {
+        if (!db || !isAuthReady || userRole !== 'admin') {
+            setAllStudents([]); // Clear student list if not admin
+            return;
+        }
+
+        const fetchAllStudents = async () => {
+            try {
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                const userMetadataRef = collection(db, `artifacts/${appId}/public/data/user_metadata`);
+                const querySnapshot = await getDocs(userMetadataRef);
+                const students = [];
+                querySnapshot.forEach((doc) => {
+                    const data = doc.data();
+                    if (data.role === 'student' || data.role === 'admin') { // Admin can see other admins too
+                        students.push({ id: doc.id, email: data.email, role: data.role });
+                    }
+                });
+                setAllStudents(students);
+            } catch (error) {
+                console.error("Error fetching all students for admin:", error);
+                setMessage(`ข้อผิดพลาดในการดึงรายชื่อนักเรียน: ${error.message}`);
+                showModal('ผิดพลาด', `ไม่สามารถดึงรายชื่อนักเรียนได้: ${error.message}`, 'error');
+            }
+        };
+
+        const unsubscribe = onSnapshot(
+            collection(db, `artifacts/${(typeof __app_id !== 'undefined' ? __app_id : 'default-app-id')}/public/data/user_metadata`),
+            (snapshot) => {
+                let currentTotal = 0;
+                const students = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    if (data.role === 'student' || data.role === 'admin') {
+                         students.push({ id: doc.id, email: data.email, role: data.role });
+                    }
+                });
+                setAllStudents(students);
+            },
+            (error) => {
+                console.error("Error fetching all students for admin:", error);
+                setMessage(`ข้อผิดพลาดในการดึงรายชื่อนักเรียน: ${error.message}`);
+                showModal('ผิดพลาด', `ไม่สามารถดึงรายชื่อนักเรียนได้: ${error.message}`, 'error');
+            }
+        );
+
+        return () => unsubscribe();
+    }, [db, isAuthReady, userRole]);
+
+    // --- Admin: Fetch selected student's savings data ---
+    useEffect(() => {
+        if (!db || !selectedStudentId || userRole !== 'admin') {
+            setSelectedStudentSavings([]);
+            setSelectedStudentTotalSavings(0);
+            return;
+        }
+
+        const savingsCollectionRef = collection(db, `artifacts/${selectedStudentId}/users/${selectedStudentId}/savings`);
+        const q = query(savingsCollectionRef);
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            let currentTotal = 0;
+            const history = [];
+            snapshot.forEach((doc) => {
+                const data = doc.data();
+                if (data.amount) {
+                    currentTotal += data.amount;
+                }
+                history.push({ id: doc.id, ...data });
+            });
+
+            history.sort((a, b) => (b.timestamp?.toDate() || 0) - (a.timestamp?.toDate() || 0));
+
+            setSelectedStudentTotalSavings(currentTotal);
+            setSelectedStudentSavings(history);
+        }, (error) => {
+            console.error(`Error fetching savings data for student ${selectedStudentId}:`, error);
+            setMessage(`ข้อผิดพลาดในการดึงข้อมูลการออมของนักเรียนที่เลือก: ${error.message}`);
+            showModal('ผิดพลาด', `ไม่สามารถดึงข้อมูลการออมของนักเรียนที่เลือกได้: ${error.message}`, 'error');
+        });
+
+        return () => unsubscribe();
+    }, [db, selectedStudentId, userRole]);
+
+
+    // --- Authentication Handlers ---
+    const handleRegister = async () => {
+        if (!auth || !db) return;
+        if (registerPassword !== registerConfirmPassword) {
+            showModal('ผิดพลาด', 'รหัสผ่านและยืนยันรหัสผ่านไม่ตรงกัน', 'error');
+            return;
+        }
+        try {
+            const userCredential = await createUserWithEmailAndPassword(auth, registerEmail, registerPassword);
+            const user = userCredential.user;
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            // Store user metadata in public collection
+            await setDoc(doc(db, `artifacts/${appId}/public/data/user_metadata`, user.uid), {
+                email: user.email,
+                role: 'student', // Default role for new registrations
+                createdAt: serverTimestamp()
+            });
+            setMessage('ลงทะเบียนสำเร็จ! คุณเข้าสู่ระบบแล้ว');
+            showModal('สำเร็จ', 'ลงทะเบียนและเข้าสู่ระบบสำเร็จ!', 'success');
+            setCurrentView('dashboard');
+        } catch (error) {
+            console.error("Registration error:", error);
+            setMessage(`ข้อผิดพลาดในการลงทะเบียน: ${error.message}`);
+            showModal('ผิดพลาด', `ไม่สามารถลงทะเบียนได้: ${error.message}`, 'error');
+        }
+    };
+
+    const handleLogin = async () => {
+        if (!auth || !db) return;
+        try {
+            const userCredential = await signInWithEmailAndPassword(auth, loginEmail, loginPassword);
+            const user = userCredential.user;
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            // Fetch user role from public collection
+            const userProfileRef = doc(db, `artifacts/${appId}/public/data/user_metadata`, user.uid);
+            const userProfileSnap = await getDoc(userProfileRef);
+            let role = 'student'; // Default to student
+            if (userProfileSnap.exists()) {
+                role = userProfileSnap.data().role;
+            } else {
+                 // Should not happen for registered users, but create profile if missing
+                await setDoc(userProfileRef, {
+                    email: user.email,
+                    role: 'student',
+                    createdAt: serverTimestamp()
+                });
+            }
+            setUserRole(role);
+            setUserId(user.uid);
+            setUserEmail(user.email);
+            setMessage('เข้าสู่ระบบสำเร็จ!');
+            showModal('สำเร็จ', 'เข้าสู่ระบบสำเร็จ!', 'success');
+            setCurrentView('dashboard');
+        } catch (error) {
+            console.error("Login error:", error);
+            setMessage(`ข้อผิดพลาดในการเข้าสู่ระบบ: ${error.message}`);
+            showModal('ผิดพลาด', `ไม่สามารถเข้าสู่ระบบได้: ${error.message}`, 'error');
+        }
+    };
+
+    const handleLogout = async () => {
+        if (!auth) return;
+        try {
+            await signOut(auth);
+            setUserId(null);
+            setUserEmail('');
+            setUserRole('guest');
+            setSavingsHistory([]);
+            setTotalSavings(0);
+            setMessage('ออกจากระบบแล้ว');
+            showModal('สำเร็จ', 'คุณออกจากระบบแล้ว', 'success');
+            setCurrentView('login-register'); // Go back to login/register page
+        } catch (error) {
+            console.error("Logout error:", error);
+            setMessage(`ข้อผิดพลาดในการออกจากระบบ: ${error.message}`);
+            showModal('ผิดพลาด', `ไม่สามารถออกจากระบบได้: ${error.message}`, 'error');
+        }
+    };
+
+    // --- Savings Entry Handler (Student specific) ---
+    const handleSaveMoney = async () => {
+        if (!db || !userId || userRole !== 'student') {
+            showModal('แจ้งเตือน', 'คุณไม่มีสิทธิ์ในการบันทึกเงินออม โปรดเข้าสู่ระบบในฐานะนักเรียน', 'info');
+            return;
+        }
+
+        const amount = parseFloat(savingsAmount);
+        if (isNaN(amount) || amount <= 0) {
+            showModal('ผิดพลาด', 'จำนวนเงินต้องเป็นตัวเลขและมากกว่า 0', 'error');
+            return;
+        }
+
+        try {
+            const savingsCollectionRef = collection(db, `artifacts/${userId}/users/${userId}/savings`);
+            await addDoc(savingsCollectionRef, {
+                amount: amount,
+                description: savingsDescription || 'เงินออม',
+                timestamp: serverTimestamp(),
+            });
+            setSavingsAmount('');
+            setSavingsDescription('');
+            setMessage('บันทึกเงินออมสำเร็จ!');
+            showModal('สำเร็จ', 'เงินออมถูกบันทึกเรียบร้อยแล้ว', 'success');
+        } catch (error) {
+            console.error("Error saving money:", error);
+            setMessage(`ข้อผิดพลาดในการบันทึก: ${error.message}`);
+            showModal('ผิดพลาด', `ไม่สามารถบันทึกเงินออมได้: ${error.message}`, 'error');
+        }
+    };
+
+    // --- Delete Savings Entry (Student specific) ---
+    const handleDeleteSavings = (id) => {
+        showModal('ยืนยันการลบ', 'คุณแน่ใจหรือไม่ที่ต้องการลบรายการออมนี้?', 'confirm', async () => {
+            if (!db || !userId || userRole !== 'student') {
+                showModal('แจ้งเตือน', 'คุณไม่มีสิทธิ์ในการลบรายการนี้', 'info');
+                return;
+            }
+            try {
+                const docRef = doc(db, `artifacts/${userId}/users/${userId}/savings`, id);
+                await deleteDoc(docRef);
+                setMessage('ลบรายการออมสำเร็จ!');
+                showModal('สำเร็จ', 'รายการออมถูกลบเรียบร้อยแล้ว', 'success');
+            } catch (error) {
+                console.error("Error deleting savings:", error);
+                setMessage(`ข้อผิดพลาดในการลบ: ${error.message}`);
+                showModal('ผิดพลาด', `ไม่สามารถลบรายการออมได้: ${error.message}`, 'error');
+            }
+        });
+    };
+
+    // --- Data Import/Export (Student/Admin) ---
+    const handleImportData = () => {
+        // This is a placeholder. Real implementation would involve file input and parsing.
+        showModal('แจ้งเตือน', 'ฟังก์ชันนำเข้าข้อมูล (Excel/CSV) ยังไม่พร้อมใช้งาน', 'info');
+        setMessage('ฟังก์ชันนำเข้าข้อมูลยังอยู่ในระหว่างการพัฒนา');
+    };
+
+    const handleExportData = (targetUserId = userId, isIndividual = true) => {
+        let dataToExport = [];
+        let filenamePrefix = '';
+
+        if (isIndividual) {
+            dataToExport = savingsHistory; // For student's own data
+            filenamePrefix = 'my_saving_data';
+        } else {
+            // Admin exporting selected student's data
+            dataToExport = selectedStudentSavings;
+            filenamePrefix = `${selectedStudentEmail.split('@')[0]}_saving_data`; // Use part of email for filename
+        }
+
+        if (dataToExport.length === 0) {
+            showModal('แจ้งเตือน', 'ไม่มีข้อมูลให้ส่งออก', 'info');
+            return;
+        }
+
+        const headers = ['วันที่', 'จำนวนเงิน', 'คำอธิบาย'];
+        const csvRows = [
+            headers.join(','),
+            ...dataToExport.map(item => {
+                const date = item.timestamp?.toDate ? item.timestamp.toDate().toLocaleDateString('th-TH') : 'N/A';
+                return `${date},${item.amount},"${item.description ? item.description.replace(/"/g, '""') : 'ไม่มีคำอธิบาย'}"`;
+            })
+        ];
+
+        const csvString = csvRows.join('\n');
+        const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.setAttribute('download', `${filenamePrefix}_${new Date().toLocaleDateString('en-CA')}.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        setMessage('ส่งออกข้อมูลสำเร็จ!');
+        showModal('สำเร็จ', 'ข้อมูลถูกส่งออกเป็นไฟล์ CSV เรียบร้อยแล้ว', 'success');
+    };
+
+    // --- Admin Dashboard Functions ---
+    const handleSelectStudent = (studentId, studentEmail) => {
+        setSelectedStudentId(studentId);
+        setSelectedStudentEmail(studentEmail);
+        setCurrentView('admin-dashboard'); // Stay on admin dashboard, but show selected student details
+    };
+
+    const handleClearSelectedStudent = () => {
+        setSelectedStudentId(null);
+        setSelectedStudentEmail('');
+        setSelectedStudentSavings([]);
+        setSelectedStudentTotalSavings(0);
+    };
+
+    // --- Custom Modal Functions ---
+    const showModal = (title, message, type = 'info', action = null) => {
+        setModalContent({ title, message, type });
+        setModalAction(() => action); // Use a functional update for setModalAction
+        setIsModalOpen(true);
+    };
+
+    const closeModal = () => {
+        setIsModalOpen(false);
+        setModalAction(null);
+    };
+
+    const handleModalConfirm = () => {
+        if (modalAction) {
+            modalAction();
+        }
+        closeModal();
+    };
+
+    // --- UI Components ---
+    const renderLoginRegister = () => (
+        <div className="flex flex-col items-center justify-center p-4">
+            <h2 className="text-3xl font-bold mb-6 text-indigo-700">เข้าสู่ระบบ / ลงทะเบียน</h2>
+            <div className="bg-white p-8 rounded-xl shadow-lg w-full max-w-md mb-8">
+                <h3 className="text-xl font-semibold mb-4 text-gray-800">เข้าสู่ระบบ</h3>
+                <div className="mb-4">
+                    <label className="block text-gray-700 text-sm font-bold mb-2">
+                        อีเมล:
+                    </label>
+                    <input
+                        type="email"
+                        className="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        value={loginEmail}
+                        onChange={(e) => setLoginEmail(e.target.value)}
+                        placeholder="your@email.com"
+                    />
+                </div>
+                <div className="mb-6">
+                    <label className="block text-gray-700 text-sm font-bold mb-2">
+                        รหัสผ่าน:
+                    </label>
+                    <input
+                        type="password"
+                        className="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        value={loginPassword}
+                        onChange={(e) => setLoginPassword(e.target.value)}
+                        placeholder="********"
+                    />
+                </div>
+                <button
+                    onClick={handleLogin}
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-xl focus:outline-none focus:shadow-outline transition duration-300 transform hover:scale-105 shadow-lg"
+                >
+                    เข้าสู่ระบบ
+                </button>
+            </div>
+
+            <div className="bg-white p-8 rounded-xl shadow-lg w-full max-w-md">
+                <h3 className="text-xl font-semibold mb-4 text-gray-800">ลงทะเบียน</h3>
+                <div className="mb-4">
+                    <label className="block text-gray-700 text-sm font-bold mb-2">
+                        อีเมล:
+                    </label>
+                    <input
+                        type="email"
+                        className="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={registerEmail}
+                        onChange={(e) => setRegisterEmail(e.target.value)}
+                        placeholder="new@email.com"
+                    />
+                </div>
+                <div className="mb-4">
+                    <label className="block text-gray-700 text-sm font-bold mb-2">
+                        รหัสผ่าน:
+                    </label>
+                    <input
+                        type="password"
+                        id="registerPassword"
+                        className="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={registerPassword}
+                        onChange={(e) => setRegisterPassword(e.target.value)}
+                        placeholder="********"
+                    />
+                </div>
+                <div className="mb-6">
+                    <label className="block text-gray-700 text-sm font-bold mb-2">
+                        ยืนยันรหัสผ่าน:
+                    </label>
+                    <input
+                        type="password"
+                        id="registerConfirmPassword"
+                        className="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={registerConfirmPassword}
+                        onChange={(e) => setRegisterConfirmPassword(e.target.value)}
+                        placeholder="********"
+                    />
+                </div>
+                <button
+                    onClick={handleRegister}
+                    className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-xl focus:outline-none focus:shadow-outline transition duration-300 transform hover:scale-105 shadow-lg"
+                >
+                    ลงทะเบียน
+                </button>
+            </div>
+        </div>
+    );
+
+
+    const renderDashboard = () => (
+        <div className="flex flex-col items-center justify-center p-4">
+            <h2 className="text-3xl font-bold mb-6 text-indigo-700">ภาพรวมการออมของคุณ</h2>
+            <div className="bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-xl shadow-lg p-6 mb-8 w-full max-w-sm text-center">
+                <p className="text-lg">ยอดเงินออมทั้งหมด:</p>
+                <p className="text-5xl font-extrabold mt-2">฿{totalSavings.toLocaleString('th-TH')}</p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-2xl">
+                {/* Quick Info Box 1 */}
+                <div className="bg-white rounded-xl shadow-md p-6 text-center">
+                    <h3 className="text-xl font-semibold text-gray-800 mb-3">เป้าหมายการออม (เร็วๆ นี้)</h3>
+                    <p className="text-gray-600">ตั้งเป้าหมายและติดตามความคืบหน้า!</p>
+                    <button
+                        onClick={() => showModal('แจ้งเตือน', 'ฟังก์ชันตั้งเป้าหมายการออมยังไม่พร้อมใช้งาน', 'info')}
+                        className="mt-4 px-6 py-2 bg-indigo-500 text-white rounded-full hover:bg-indigo-600 transition duration-300 shadow"
+                    >
+                        ตั้งเป้าหมาย
+                    </button>
+                </div>
+
+                {/* Quick Info Box 2 */}
+                <div className="bg-white rounded-xl shadow-md p-6 text-center">
+                    <h3 className="text-xl font-semibold text-gray-800 mb-3">กราฟแนวโน้ม (เร็วๆ นี้)</h3>
+                    <p className="text-gray-600">ดูการเติบโตของเงินออมของคุณด้วยกราฟ</p>
+                    <button
+                        onClick={() => showModal('แจ้งเตือน', 'ฟังก์ชันแสดงกราฟแนวโน้มยังไม่พร้อมใช้งาน', 'info')}
+                        className="mt-4 px-6 py-2 bg-purple-500 text-white rounded-full hover:bg-purple-600 transition duration-300 shadow"
+                    >
+                        ดูกราฟ
+                    </button>
+                </div>
+            </div>
+
+            {/* User ID Display */}
+            {userId && (
+                <div className="mt-8 p-4 bg-gray-100 rounded-lg text-sm text-gray-600 text-center w-full max-w-md break-words shadow-inner">
+                    <p>รหัสผู้ใช้งาน (User ID): <span className="font-semibold text-blue-800">{userId}</span></p>
+                    <p>อีเมล: <span className="font-semibold text-blue-800">{userEmail}</span></p>
+                    <p>บทบาท: <span className="font-semibold text-blue-800">{userRole}</span></p>
+                </div>
+            )}
+        </div>
+    );
+
+    const renderSaveMoney = () => (
+        <div className="flex flex-col items-center p-4">
+            <h2 className="text-3xl font-bold mb-6 text-indigo-700">บันทึกเงินออมใหม่</h2>
+            {userRole === 'student' ? (
+                <div className="bg-white p-8 rounded-xl shadow-lg w-full max-w-md">
+                    <div className="mb-5">
+                        <label htmlFor="amount" className="block text-gray-700 text-sm font-bold mb-2">
+                            จำนวนเงิน (บาท):
+                        </label>
+                        <input
+                            type="number"
+                            id="amount"
+                            className="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition duration-200"
+                            value={savingsAmount}
+                            onChange={(e) => setSavingsAmount(e.target.value)}
+                            placeholder="เช่น 20.50"
+                        />
+                    </div>
+                    <div className="mb-6">
+                        <label htmlFor="description" className="block text-gray-700 text-sm font-bold mb-2">
+                            คำอธิบาย (ไม่บังคับ):
+                        </label>
+                        <input
+                            type="text"
+                            id="description"
+                            className="shadow appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition duration-200"
+                            value={savingsDescription}
+                            onChange={(e) => setSavingsDescription(e.target.value)}
+                            placeholder="เช่น ค่าขนม, เงินรางวัล"
+                        />
+                    </div>
+                    <button
+                        onClick={handleSaveMoney}
+                        className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-xl focus:outline-none focus:shadow-outline transition duration-300 transform hover:scale-105 shadow-lg"
+                    >
+                        บันทึกเงินออม
+                    </button>
+                </div>
+            ) : (
+                <p className="text-center text-gray-600 text-lg mt-10">คุณไม่มีสิทธิ์ในการบันทึกเงินออมในฐานะผู้ดูแลระบบ</p>
+            )}
+        </div>
+    );
+
+    const renderHistory = () => (
+        <div className="p-4">
+            <h2 className="text-3xl font-bold mb-6 text-indigo-700 text-center">ประวัติการออม</h2>
+            {userRole === 'student' ? (
+                savingsHistory.length === 0 ? (
+                    <p className="text-center text-gray-600 text-lg mt-10">ยังไม่มีรายการออมเงิน</p>
+                ) : (
+                    <div className="overflow-x-auto rounded-xl shadow-lg">
+                        <table className="min-w-full bg-white border border-gray-200 rounded-xl">
+                            <thead>
+                                <tr className="bg-indigo-100 text-indigo-800 uppercase text-sm leading-normal">
+                                    <th className="py-3 px-6 text-left">วันที่</th>
+                                    <th className="py-3 px-6 text-left">คำอธิบาย</th>
+                                    <th className="py-3 px-6 text-right">จำนวนเงิน (บาท)</th>
+                                    <th className="py-3 px-6 text-center"></th> {/* For delete button */}
+                                </tr>
+                            </thead>
+                            <tbody className="text-gray-700 text-sm font-light">
+                                {savingsHistory.map((item) => (
+                                    <tr key={item.id} className="border-b border-gray-200 hover:bg-gray-50 transition duration-150">
+                                        <td className="py-3 px-6 text-left whitespace-nowrap">
+                                            {item.timestamp?.toDate ? item.timestamp.toDate().toLocaleDateString('th-TH') : 'N/A'}
+                                        </td>
+                                        <td className="py-3 px-6 text-left">
+                                            {item.description || 'ไม่มีคำอธิบาย'}
+                                        </td>
+                                        <td className="py-3 px-6 text-right font-medium text-green-700">
+                                            +฿{item.amount.toLocaleString('th-TH')}
+                                        </td>
+                                        <td className="py-3 px-6 text-center">
+                                            <button
+                                                onClick={() => handleDeleteSavings(item.id)}
+                                                className="bg-red-500 hover:bg-red-600 text-white font-bold py-1 px-3 rounded-full text-xs transition duration-200 shadow-sm"
+                                            >
+                                                ลบ
+                                            </button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )
+            ) : (
+                <p className="text-center text-gray-600 text-lg mt-10">คุณไม่มีสิทธิ์ในการดูประวัติการออมส่วนตัวในฐานะผู้ดูแลระบบ</p>
+            )}
+        </div>
+    );
+
+    const renderImportExport = () => (
+        <div className="flex flex-col items-center p-4">
+            <h2 className="text-3xl font-bold mb-6 text-indigo-700">นำเข้า/ส่งออกข้อมูล</h2>
+            <div className="bg-white p-8 rounded-xl shadow-lg w-full max-w-md flex flex-col items-center space-y-6">
+                <button
+                    onClick={handleImportData}
+                    className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-xl focus:outline-none focus:shadow-outline transition duration-300 transform hover:scale-105 shadow-lg flex items-center justify-center"
+                >
+                    <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                    นำเข้าข้อมูล (Excel/CSV)
+                </button>
+                {userRole === 'student' && (
+                    <button
+                        onClick={() => handleExportData(userId, true)}
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-xl focus:outline-none focus:shadow-outline transition duration-300 transform hover:scale-105 shadow-lg flex items-center justify-center"
+                    >
+                        <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2v-7a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2z"></path></svg>
+                        ส่งออกข้อมูลส่วนตัว (CSV)
+                    </button>
+                )}
+                {userRole === 'admin' && selectedStudentId && (
+                    <button
+                        onClick={() => handleExportData(selectedStudentId, false)}
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-xl focus:outline-none focus:shadow-outline transition duration-300 transform hover:scale-105 shadow-lg flex items-center justify-center"
+                    >
+                        <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2v-7a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2z"></path></svg>
+                        ส่งออกข้อมูลของ {selectedStudentEmail} (CSV)
+                    </button>
+                )}
+                <p className="text-sm text-gray-500 mt-4 text-center">
+                    (การนำเข้าข้อมูลรองรับเฉพาะไฟล์ CSV ที่มีรูปแบบ 'วันที่,จำนวนเงิน,คำอธิบาย')
+                </p>
+            </div>
+        </div>
+    );
+
+    const renderAdminDashboard = () => (
+        <div className="p-4">
+            <h2 className="text-3xl font-bold mb-6 text-indigo-700 text-center">แดชบอร์ดผู้ดูแลระบบ</h2>
+            <p className="text-center text-gray-600 text-lg mb-6">เลือกนักเรียนเพื่อดูข้อมูลการออม</p>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {/* List of Students */}
+                <div className="bg-white rounded-xl shadow-lg p-6">
+                    <h3 className="text-xl font-semibold mb-4 text-gray-800">รายชื่อนักเรียน</h3>
+                    {allStudents.length === 0 ? (
+                        <p className="text-gray-600">ไม่มีนักเรียนที่ลงทะเบียน</p>
+                    ) : (
+                        <ul className="space-y-2">
+                            {allStudents.map((student) => (
+                                <li
+                                    key={student.id}
+                                    className={`p-3 rounded-lg cursor-pointer flex justify-between items-center transition duration-200 ${selectedStudentId === student.id ? 'bg-indigo-100 text-indigo-800 font-semibold shadow-md' : 'bg-gray-50 hover:bg-gray-100'}`}
+                                    onClick={() => handleSelectStudent(student.id, student.email)}
+                                >
+                                    <span>{student.email} ({student.role})</span>
+                                    <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7"></path></svg>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+
+                {/* Selected Student's Savings Details */}
+                <div className="bg-white rounded-xl shadow-lg p-6">
+                    <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-xl font-semibold text-gray-800">
+                            {selectedStudentId ? `ข้อมูลการออมของ ${selectedStudentEmail}` : 'โปรดเลือกนักเรียน'}
+                        </h3>
+                        {selectedStudentId && (
+                            <button
+                                onClick={handleClearSelectedStudent}
+                                className="px-3 py-1 bg-gray-200 text-gray-700 rounded-full text-sm hover:bg-gray-300 transition duration-200"
+                            >
+                                ล้าง
+                            </button>
+                        )}
+                    </div>
+                    {selectedStudentId ? (
+                        <div>
+                            <div className="bg-gradient-to-r from-green-500 to-teal-600 text-white rounded-xl shadow-md p-4 mb-4 text-center">
+                                <p className="text-md">ยอดเงินออมรวม:</p>
+                                <p className="text-4xl font-extrabold mt-1">฿{selectedStudentTotalSavings.toLocaleString('th-TH')}</p>
+                            </div>
+                            {selectedStudentSavings.length === 0 ? (
+                                <p className="text-center text-gray-600 mt-5">ยังไม่มีรายการออมเงินสำหรับนักเรียนคนนี้</p>
+                            ) : (
+                                <div className="overflow-x-auto rounded-xl border border-gray-200">
+                                    <table className="min-w-full bg-white">
+                                        <thead>
+                                            <tr className="bg-green-50 text-green-800 uppercase text-xs leading-normal">
+                                                <th className="py-2 px-4 text-left">วันที่</th>
+                                                <th className="py-2 px-4 text-left">คำอธิบาย</th>
+                                                <th className="py-2 px-4 text-right">จำนวนเงิน (บาท)</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="text-gray-700 text-sm font-light">
+                                            {selectedStudentSavings.map((item) => (
+                                                <tr key={item.id} className="border-b border-gray-100 hover:bg-gray-50">
+                                                    <td className="py-2 px-4 text-left whitespace-nowrap">
+                                                        {item.timestamp?.toDate ? item.timestamp.toDate().toLocaleDateString('th-TH') : 'N/A'}
+                                                    </td>
+                                                    <td className="py-2 px-4 text-left">
+                                                        {item.description || 'ไม่มีคำอธิบาย'}
+                                                    </td>
+                                                    <td className="py-2 px-4 text-right font-medium text-green-700">
+                                                        +฿{item.amount.toLocaleString('th-TH')}
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                            <button
+                                onClick={() => handleExportData(selectedStudentId, false)}
+                                className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl focus:outline-none focus:shadow-outline transition duration-300 transform hover:scale-105 shadow-lg flex items-center justify-center"
+                            >
+                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2v-7a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2z"></path></svg>
+                                ส่งออกข้อมูลของ {selectedStudentEmail} (CSV)
+                            </button>
+                        </div>
+                    ) : (
+                        <p className="text-center text-gray-600 mt-10">เลือกนักเรียนจากรายการทางซ้ายเพื่อดูข้อมูล</p>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+
+
+    const renderContent = () => {
+        if (!isAuthReady) {
+            return (
+                <div className="flex justify-center items-center h-64 text-xl text-gray-600">
+                    กำลังโหลด...
+                </div>
+            );
+        }
+
+        if (userRole === 'guest' && currentView !== 'login-register') {
+             // If not authenticated, always show login/register
+            return renderLoginRegister();
+        }
+
+        switch (currentView) {
+            case 'dashboard':
+                return renderDashboard();
+            case 'save':
+                return renderSaveMoney();
+            case 'history':
+                return renderHistory();
+            case 'import-export':
+                return renderImportExport();
+            case 'login-register':
+                return renderLoginRegister();
+            case 'admin-dashboard':
+                if (userRole === 'admin') {
+                    return renderAdminDashboard();
+                } else {
+                    return <p className="text-center text-red-600 text-lg mt-10">คุณไม่มีสิทธิ์เข้าถึงหน้านี้</p>;
+                }
+            default:
+                return renderDashboard();
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-pink-50 font-inter text-gray-900 flex flex-col">
+            {/* Tailwind CSS CDN */}
+            <script src="https://cdn.tailwindcss.com"></script>
+            <style>{`
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+                body {
+                    font-family: 'Inter', sans-serif;
+                }
+            `}</style>
+
+            {/* Header */}
+            <header className="bg-white shadow-md p-4 flex flex-col sm:flex-row items-center justify-between">
+                <h1 className="text-3xl font-extrabold text-indigo-800 mb-2 sm:mb-0">
+                    Smart Saver Student
+                </h1>
+                <nav className="flex flex-wrap justify-center sm:justify-end gap-3">
+                    {userRole !== 'guest' && ( // Show dashboard for logged-in users
+                        <button
+                            onClick={() => setCurrentView('dashboard')}
+                            className={`px-4 py-2 rounded-full font-medium transition-all duration-300 ${currentView === 'dashboard' ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                        >
+                            แดชบอร์ด
+                        </button>
+                    )}
+
+                    {userRole === 'student' && (
+                        <>
+                            <button
+                                onClick={() => setCurrentView('save')}
+                                className={`px-4 py-2 rounded-full font-medium transition-all duration-300 ${currentView === 'save' ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                            >
+                                บันทึกออม
+                            </button>
+                            <button
+                                onClick={() => setCurrentView('history')}
+                                className={`px-4 py-2 rounded-full font-medium transition-all duration-300 ${currentView === 'history' ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                            >
+                                ประวัติ
+                            </button>
+                        </>
+                    )}
+
+                    {userRole === 'admin' && (
+                        <button
+                            onClick={() => { setCurrentView('admin-dashboard'); handleClearSelectedStudent(); }}
+                            className={`px-4 py-2 rounded-full font-medium transition-all duration-300 ${currentView === 'admin-dashboard' ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                        >
+                            ผู้ดูแลระบบ
+                        </button>
+                    )}
+
+                    {userRole !== 'guest' && ( // Import/Export available for logged-in users
+                        <button
+                            onClick={() => setCurrentView('import-export')}
+                            className={`px-4 py-2 rounded-full font-medium transition-all duration-300 ${currentView === 'import-export' ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                        >
+                            นำเข้า/ส่งออก
+                        </button>
+                    )}
+
+                    {userRole === 'guest' ? (
+                        <button
+                            onClick={() => setCurrentView('login-register')}
+                            className={`px-4 py-2 rounded-full font-medium bg-green-500 text-white hover:bg-green-600 transition-all duration-300 shadow-md`}
+                        >
+                            เข้าสู่ระบบ/ลงทะเบียน
+                        </button>
+                    ) : (
+                        <button
+                            onClick={handleLogout}
+                            className="px-4 py-2 rounded-full font-medium bg-red-500 text-white hover:bg-red-600 transition-all duration-300 shadow-md"
+                        >
+                            ออกจากระบบ
+                        </button>
+                    )}
+                </nav>
+            </header>
+
+            {/* Main Content Area */}
+            <main className="flex-grow container mx-auto p-4 md:p-8">
+                {/* Global Message Display */}
+                {message && (
+                    <div className="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded-lg relative mb-4 shadow-sm" role="alert">
+                        <span className="block sm:inline">{message}</span>
+                    </div>
+                )}
+
+                {/* Render current view */}
+                {renderContent()}
+            </main>
+
+            {/* Custom Modal */}
+            {isModalOpen && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm text-center">
+                        <h3 className={`text-xl font-bold mb-4 ${modalContent.type === 'error' ? 'text-red-600' : modalContent.type === 'success' ? 'text-green-600' : 'text-indigo-600'}`}>
+                            {modalContent.title}
+                        </h3>
+                        <p className="text-gray-700 mb-6">{modalContent.message}</p>
+                        <div className="flex justify-center gap-4">
+                            {modalContent.type === 'confirm' && (
+                                <button
+                                    onClick={handleModalConfirm}
+                                    className="px-5 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition duration-300 shadow"
+                                >
+                                    ยืนยัน
+                                </button>
+                            )}
+                            <button
+                                onClick={closeModal}
+                                className={`px-5 py-2 ${modalContent.type === 'confirm' ? 'bg-gray-300 text-gray-800 hover:bg-gray-400' : 'bg-indigo-500 text-white hover:bg-indigo-600'} rounded-lg transition duration-300 shadow`}
+                            >
+                                ตกลง
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default App;
